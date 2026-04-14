@@ -22,3 +22,6 @@ print(df[['width', 'height']].describe())
 
 print("Images per number:")
 print(df['number'].value_counts())
+
+dataset_test = ImageFolder(root='data/test')
+print(f"Test dataset: {len(dataset_test)} images")
