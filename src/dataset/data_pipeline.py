@@ -7,6 +7,7 @@ class DataPipeline:
         self.test_dataset = NumbersDataset(val_df, transforms["validation"])
 
     def get_loaders(self, batch_size=64):
-        train_loader = DataLoader(self.train_dataset, batch_size=batch_size, shuffle=True)
-        val_loader = DataLoader(self.test_dataset, batch_size=batch_size, shuffle=False)
+        # Added num_workers to parallelize CPU augmentations and pin_memory to speed up GPU transfer
+        train_loader = DataLoader(self.train_dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
+        val_loader = DataLoader(self.test_dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
         return train_loader, val_loader

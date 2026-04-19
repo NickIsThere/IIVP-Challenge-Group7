@@ -5,19 +5,21 @@ from torchvision import transforms
 from src.dataset.data_pipeline import DataPipeline
 from src.dataset.trainer import Trainer
 from src.models.factory import Factory
+from src.dataset.augmentation import Augmentation
 
 N_FOLDS = 5
 BATCH_SIZE = 64
 EPOCHS = 10
 csv_path = f'folds/train_folds_{N_FOLDS}.csv'
 
-
 def training_session(df, name_model, fold):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     data_transforms = {
         'train': transforms.Compose([
+            Augmentation(prob=0.4),
             transforms.ToTensor(),
+            transforms.RandomApply([transforms.ElasticTransform(alpha=34.0, sigma=4.0)], p=0.4)
         ]),
         'validation': transforms.Compose([
             transforms.ToTensor(),
@@ -59,7 +61,7 @@ def main():
         print(f"Fold {fold + 1}/{N_FOLDS} | best accuracy: {result:.4f}")
     accuracy = sum(results) / len(results)
     print(f"Average accuracy: {accuracy:.5f}")
-    # Current: Average accuracy: 0.99706
+    # Current: Average accuracy:  0.99806
 
 if __name__ == "__main__":
     main()
