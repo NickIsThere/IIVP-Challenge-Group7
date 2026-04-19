@@ -1,4 +1,5 @@
 import torch
+from tqdm import tqdm
 
 class Trainer:
     def __init__(self, model, criterion, optimizer, device):
@@ -14,7 +15,9 @@ class Trainer:
         correct = 0
         total = 0
 
-        for images, labels in loader:
+        progress_bar = tqdm(loader, desc="Training", leave=False)
+
+        for images, labels in progress_bar:
             images = images.to(self.device)
             labels = labels.to(self.device)
 
@@ -28,6 +31,8 @@ class Trainer:
             preds = outputs.argmax(dim=1)
             correct += (preds == labels).sum().item()
             total += labels.size(0)
+
+            progress_bar.set_postfix({"loss": f"{loss.item():.4f}"})
 
         epoch_loss = running_loss / total
         epoch_acc = correct / total

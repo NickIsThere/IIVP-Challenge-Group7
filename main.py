@@ -18,8 +18,8 @@ def training_session(df, name_model, fold):
     data_transforms = {
         'train': transforms.Compose([
             Augmentation(prob=0.4),
+            transforms.RandomApply([transforms.ElasticTransform(alpha=34.0, sigma=4.0)], p=0.4),
             transforms.ToTensor(),
-            transforms.RandomApply([transforms.ElasticTransform(alpha=34.0, sigma=4.0)], p=0.4)
         ]),
         'validation': transforms.Compose([
             transforms.ToTensor(),
@@ -30,7 +30,7 @@ def training_session(df, name_model, fold):
     val_df = df[df['fold'] == fold].reset_index(drop=True)
 
     pipeline = DataPipeline(train_df, val_df, transforms=data_transforms)
-    train_loader, val_loader = pipeline.get_loaders(batch_size=BATCH_SIZE)
+    train_loader, val_loader = pipeline.get_loaders(batch_size=BATCH_SIZE, num_workers=4)
 
     model = Factory.get_model(name_model, num_classes=10)
     model = model.to(device)
@@ -56,7 +56,7 @@ def main():
     results = []
     for fold in range(N_FOLDS):
         print(f"Fold {fold + 1}")
-        result = training_session(df, "CNN", fold)
+        result = training_session(df, "ResNet34", fold)
         results.append(result)
         print(f"Fold {fold + 1}/{N_FOLDS} | best accuracy: {result:.4f}")
     accuracy = sum(results) / len(results)

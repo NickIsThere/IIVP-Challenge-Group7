@@ -19,7 +19,8 @@ class Augmentation(object):
         return cv2.warpAffine(image, M, (cols, rows))
 
     def __call__(self, img):
-        image = np.array(img)
+        # Make it standard uint8 for all pictures
+        image = np.array(img, dtype=np.uint8)
 
         # 1. Rotation (-15 to 15)
         if random.random() < self.prob:
