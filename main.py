@@ -35,10 +35,14 @@ def training_session(df, name_model, fold):
     model = Factory.get_model(name_model, num_classes=10)
     model = model.to(device)
 
-    criterion = torch.nn.CrossEntropyLoss()
+    # Add label smoothing so the model is not overconfident
+    criterion = torch.nn.CrossEntropyLoss(label_smoothing=0.1)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
-    trainer = Trainer(model, criterion, optimizer, device)
+    # Make floating learning rate using Cosine Annealing
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=1e-6)
+
+    trainer = Trainer(model, criterion, optimizer, device, scheduler)
 
     best_accuracy, history = trainer.fit(train_loader, val_loader, EPOCHS)
 
