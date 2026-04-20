@@ -10,6 +10,7 @@ from src.dataset.augmentation import Augmentation
 N_FOLDS = 5
 BATCH_SIZE = 64
 EPOCHS = 10
+MODEL_NAME = "CNN"
 csv_path = f'folds/train_folds_{N_FOLDS}.csv'
 
 def training_session(df, name_model, fold):
@@ -60,7 +61,7 @@ def main():
     results = []
     for fold in range(N_FOLDS):
         print(f"Fold {fold + 1}")
-        result = training_session(df, "ResNet34", fold)
+        result = training_session(df, MODEL_NAME, fold)
         results.append(result)
         print(f"Fold {fold + 1}/{N_FOLDS} | best accuracy: {result:.4f}")
     accuracy = sum(results) / len(results)
