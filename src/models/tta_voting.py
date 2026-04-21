@@ -1,26 +1,38 @@
+from __future__ import annotations
+
+from typing import Optional, Sequence, Union
+
 import torch
-import torchvision.transforms.functional as TF
+import torch.nn as nn
 
-def tta_voting(models_list, weights_list, images, device):
-    shift_img = TF.affine(images, angle=0, translate=[2, 2], scale=1.0, shear=0)
-    rot_img = TF.affine(images, angle=10, translate=[0, 0], scale=1.0, shear=0)
+from .tta_utils import TTAFn, soft_voting_probabilities
 
-    final_prob = torch.zeros(images.size(0), 10).to(device)
-    total_weight = sum(weights_list)
 
-    for net, weight in zip(models_list, weights_list):
-        net.eval()
-        with torch.no_grad():
-            out1 = net(images)
-            out2 = net(shift_img)
-            out3 = net(rot_img)
-            
-            p1 = torch.softmax(out1, dim=1)
-            p2 = torch.softmax(out2, dim=1)
-            p3 = torch.softmax(out3, dim=1)
-            
-            tta_prob = (p1 + p2 + p3) / 3.0
-            final_prob += tta_prob * weight
-            
-    final_prob = final_prob / total_weight
-    return torch.argmax(final_prob, dim=1)
+def tta_voting(
+    models_list: Sequence[nn.Module],
+    weights_or_images: Union[Sequence[float], torch.Tensor],
+    images_or_device: Optional[Union[torch.Tensor, torch.device]] = None,
+    device: Optional[torch.device] = None,
+    tta_transforms: Optional[Sequence[TTAFn]] = None,
+) -> torch.Tensor:
+    if torch.is_tensor(weights_or_images):
+        images = weights_or_images
+        weights_list = None
+        if images_or_device is not None:
+            device = torch.device(images_or_device)
+    else:
+        weights_list = weights_or_images
+        if images_or_device is None or not torch.is_tensor(images_or_device):
+            raise ValueError("images must be provided when weights are passed explicitly.")
+        images = images_or_device
+
+    if device is not None:
+        images = images.to(device)
+
+    probabilities = soft_voting_probabilities(
+        models_list,
+        images,
+        weights=weights_list,
+        tta_transforms=tta_transforms,
+    )
+    return probabilities.argmax(dim=1)

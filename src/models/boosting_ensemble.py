@@ -1,17 +1,18 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple, Union
+from typing import Callable, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .tta_utils import average_tta_logits, default_tta_transforms
+
 
 Tensor = torch.Tensor
-ModelDict = Mapping[str, nn.Module]
-WeightDict = Mapping[str, float]
 TTAFn = Callable[[Tensor], Tensor]
+ModelSpecValue = Union[nn.Module, "BaseModelSpec", Tuple[nn.Module, float]]
 
 
 @dataclass
@@ -22,35 +23,68 @@ class BaseModelSpec:
     use_tta: bool = True
 
 
+@dataclass
+class BaseModelOutput:
+    logits: Tensor
+    probabilities: Tensor
+    log_probabilities: Tensor
+    entropy: Tensor
+    normalized_entropy: Tensor
+    confidence: Tensor
+
+
+@dataclass
+class BoostingEnsembleOutput:
+    output_tensor: Tensor
+    predictions: Tensor
+    probabilities: Tensor
+    log_probabilities: Tensor
+    raw_logits: Optional[Tensor]
+    aggregation: str
+    model_outputs: Dict[str, BaseModelOutput]
+    dynamic_weights: Dict[str, Tensor]
+    first_pass_probabilities: Tensor
+    first_pass_log_probabilities: Tensor
+
+
 class WeightedBoostingEnsemble(nn.Module):
     """
-    Features:
-    - accepts a dict of model specs: {name: BaseModelSpec(...)}
-    - weighted aggregation in probability or logit space
-    - per-model temperature scaling
-    - optional uncertainty penalty (downweights uncertain models per batch)
-    - optional agreement bonus (upweights models that agree with the ensemble)
-    - optional TTA support
-    - returns both predictions and rich diagnostics
-
-    This is not gradient boosting in the classical sequential sense. Instead, it is a
-    boosting-style weighted combiner for independently trained neural networks.
+    Boosting-style weighted combiner for independently trained neural networks.
     """
 
     def __init__(
         self,
-        models: Mapping[str, Union[nn.Module, BaseModelSpec, Tuple[nn.Module, float]]],
+        models: Mapping[str, ModelSpecValue],
         *,
         aggregation: str = "prob",
         uncertainty_penalty: float = 0.25,
         agreement_bonus: float = 0.10,
         clamp_min_weight: float = 1e-6,
+        eps: float = 1e-8,
     ) -> None:
         super().__init__()
 
         if aggregation not in {"prob", "logit"}:
             raise ValueError("aggregation must be either 'prob' or 'logit'.")
 
+        normalized = self._normalize_model_specs(models)
+
+        self.model_names = list(normalized.keys())
+        self.models = nn.ModuleDict({name: spec.model for name, spec in normalized.items()})
+        self.specs = normalized
+
+        self.aggregation = aggregation
+        self.uncertainty_penalty = uncertainty_penalty
+        self.agreement_bonus = agreement_bonus
+        self.clamp_min_weight = clamp_min_weight
+        self.eps = eps
+
+    @staticmethod
+    def default_tta_transforms() -> List[TTAFn]:
+        return default_tta_transforms()
+
+    @staticmethod
+    def _normalize_model_specs(models: Mapping[str, ModelSpecValue]) -> Dict[str, BaseModelSpec]:
         normalized: Dict[str, BaseModelSpec] = {}
         for name, value in models.items():
             if isinstance(value, BaseModelSpec):
@@ -65,156 +99,214 @@ class WeightedBoostingEnsemble(nn.Module):
                     f"Unsupported model spec for '{name}'. Use nn.Module, BaseModelSpec, or (model, weight)."
                 )
 
-        self.model_names = list(normalized.keys())
-        self.models = nn.ModuleDict({name: spec.model for name, spec in normalized.items()})
-        self.specs = normalized
-        self.aggregation = aggregation
-        self.uncertainty_penalty = uncertainty_penalty
-        self.agreement_bonus = agreement_bonus
-        self.clamp_min_weight = clamp_min_weight
+        if not normalized:
+            raise ValueError("WeightedBoostingEnsemble requires at least one base model.")
 
-    @staticmethod
-    def default_tta_transforms() -> List[TTAFn]:
-        return [
-            lambda x: x,
-            lambda x: torch.flip(x, dims=[-1]),
-            lambda x: torch.flip(x, dims=[-2]),
-        ]
+        return normalized
 
     @staticmethod
     def _entropy(probabilities: Tensor, eps: float = 1e-8) -> Tensor:
-        return -(probabilities * (probabilities.clamp_min(eps).log())).sum(dim=1)
+        return -(probabilities * probabilities.clamp_min(eps).log()).sum(dim=1)
 
     @staticmethod
-    def _normalize_weights(weight_map: MutableMapping[str, Tensor], eps: float = 1e-8) -> MutableMapping[str, Tensor]:
-        total = None
+    def _module_device(module: nn.Module) -> Optional[torch.device]:
+        parameter = next(module.parameters(), None)
+        if parameter is not None:
+            return parameter.device
+
+        buffer = next(module.buffers(), None)
+        if buffer is not None:
+            return buffer.device
+
+        return None
+
+    @staticmethod
+    def _normalize_weights(weight_map: Mapping[str, Tensor], eps: float = 1e-8) -> Dict[str, Tensor]:
+        if not weight_map:
+            raise ValueError("weight_map must not be empty.")
+
+        total: Optional[Tensor] = None
         for value in weight_map.values():
             total = value if total is None else total + value
-        assert total is not None
+
+        if total is None:
+            raise ValueError("weight_map must not be empty.")
+
         total = total.clamp_min(eps)
-        return {k: v / total for k, v in weight_map.items()}
+        return {name: value / total for name, value in weight_map.items()}
+
+    def _validate_model_device(self, model_name: str, model: nn.Module, images: Tensor) -> None:
+        model_device = self._module_device(model)
+        if model_device is not None and model_device != images.device:
+            raise ValueError(
+                f"Base model '{model_name}' is on device {model_device}, but images are on {images.device}."
+            )
 
     def _forward_single_model(
         self,
+        model_name: str,
         model: nn.Module,
         images: Tensor,
         *,
         temperature: float,
         tta_transforms: Optional[Sequence[TTAFn]],
         use_tta: bool,
-    ) -> Dict[str, Tensor]:
-        logits_accum = None
-        transforms = list(tta_transforms) if (tta_transforms is not None and use_tta) else [lambda x: x]
+        expected_num_classes: Optional[int],
+    ) -> BaseModelOutput:
+        self._validate_model_device(model_name, model, images)
 
-        for transform in transforms:
-            augmented = transform(images)
-            logits = model(augmented) / max(temperature, 1e-8)
-            logits_accum = logits if logits_accum is None else logits_accum + logits
+        logits = average_tta_logits(
+            model,
+            images,
+            tta_transforms=tta_transforms if use_tta else (lambda batch: batch,),
+        )
 
-        assert logits_accum is not None
-        mean_logits = logits_accum / len(transforms)
-        mean_prob = F.softmax(mean_logits, dim=1)
-        entropy = self._entropy(mean_prob)
-        confidence = mean_prob.max(dim=1).values
+        if logits.ndim != 2:
+            raise ValueError(f"Base model '{model_name}' must return a 2D tensor of shape [batch, classes].")
 
-        return {
-            "logits": mean_logits,
-            "probabilities": mean_prob,
-            "entropy": entropy,
-            "confidence": confidence,
-        }
+        if logits.shape[0] != images.shape[0]:
+            raise ValueError(f"Base model '{model_name}' returned batch size {logits.shape[0]} for {images.shape[0]} inputs.")
 
-    @torch.no_grad()
-    def forward(
+        if expected_num_classes is not None and logits.shape[1] != expected_num_classes:
+            raise ValueError(
+                f"Base model '{model_name}' returned {logits.shape[1]} classes, expected {expected_num_classes}."
+            )
+
+        scaled_logits = logits / max(float(temperature), self.eps)
+        probabilities = F.softmax(scaled_logits, dim=1)
+        entropy = self._entropy(probabilities, eps=self.eps)
+        confidence = probabilities.max(dim=1).values
+
+        num_classes = probabilities.shape[1]
+        max_entropy = torch.log(
+            torch.tensor(float(max(num_classes, 2)), device=probabilities.device, dtype=probabilities.dtype)
+        )
+        normalized_entropy = entropy / max_entropy.clamp_min(self.eps)
+
+        return BaseModelOutput(
+            logits=scaled_logits,
+            probabilities=probabilities,
+            log_probabilities=probabilities.clamp_min(self.eps).log(),
+            entropy=entropy,
+            normalized_entropy=normalized_entropy,
+            confidence=confidence,
+        )
+
+    def _build_output(
         self,
         images: Tensor,
         *,
-        return_details: bool = True,
         tta_transforms: Optional[Sequence[TTAFn]] = None,
-    ) -> Union[Tensor, Dict[str, Tensor], Dict[str, object]]:
-        device = images.device
-        model_outputs: Dict[str, Dict[str, Tensor]] = {}
+    ) -> BoostingEnsembleOutput:
+        model_outputs: Dict[str, BaseModelOutput] = {}
         dynamic_weights: Dict[str, Tensor] = {}
+        expected_num_classes: Optional[int] = None
 
         for name in self.model_names:
             spec = self.specs[name]
-            model = self.models[name]
-            model.eval()
-
             output = self._forward_single_model(
-                model,
+                name,
+                self.models[name],
                 images,
                 temperature=spec.temperature,
                 tta_transforms=tta_transforms,
                 use_tta=spec.use_tta,
+                expected_num_classes=expected_num_classes,
             )
+
+            if expected_num_classes is None:
+                expected_num_classes = output.logits.shape[1]
+
             model_outputs[name] = output
 
-            base = torch.full_like(output["confidence"], fill_value=float(spec.weight), device=device)
-            uncertainty_factor = 1.0 - self.uncertainty_penalty * output["entropy"]
+            base_weight = torch.full_like(output.confidence, fill_value=float(spec.weight), device=images.device)
+            uncertainty_factor = 1.0 - self.uncertainty_penalty * output.normalized_entropy
             uncertainty_factor = uncertainty_factor.clamp_min(self.clamp_min_weight)
-            dynamic_weights[name] = base * uncertainty_factor
+            dynamic_weights[name] = base_weight * uncertainty_factor
 
-        # First pass ensemble for agreement scoring.
-        normalized_first = self._normalize_weights(dynamic_weights)
+        normalized_first = self._normalize_weights(dynamic_weights, eps=self.eps)
 
         if self.aggregation == "prob":
-            ensemble_prob = None
+            first_pass_probabilities = torch.zeros_like(next(iter(model_outputs.values())).probabilities)
             for name in self.model_names:
-                weighted = model_outputs[name]["probabilities"] * normalized_first[name].unsqueeze(1)
-                ensemble_prob = weighted if ensemble_prob is None else ensemble_prob + weighted
-            assert ensemble_prob is not None
-            ensemble_logits = ensemble_prob.clamp_min(1e-8).log()
+                first_pass_probabilities = first_pass_probabilities + (
+                    model_outputs[name].probabilities * normalized_first[name].unsqueeze(1)
+                )
+            first_pass_log_probabilities = first_pass_probabilities.clamp_min(self.eps).log()
         else:
-            ensemble_logits = None
+            first_pass_logits = torch.zeros_like(next(iter(model_outputs.values())).logits)
             for name in self.model_names:
-                weighted = model_outputs[name]["logits"] * normalized_first[name].unsqueeze(1)
-                ensemble_logits = weighted if ensemble_logits is None else ensemble_logits + weighted
-            assert ensemble_logits is not None
-            ensemble_prob = F.softmax(ensemble_logits, dim=1)
+                first_pass_logits = first_pass_logits + (model_outputs[name].logits * normalized_first[name].unsqueeze(1))
+            first_pass_probabilities = F.softmax(first_pass_logits, dim=1)
+            first_pass_log_probabilities = first_pass_probabilities.clamp_min(self.eps).log()
 
-        # Agreement bonus: boost models whose predictions align with first-pass ensemble.
-        ensemble_pred = ensemble_prob.argmax(dim=1)
+        first_pass_predictions = first_pass_probabilities.argmax(dim=1)
         for name in self.model_names:
-            model_pred = model_outputs[name]["probabilities"].argmax(dim=1)
-            agreement = (model_pred == ensemble_pred).float()
+            model_predictions = model_outputs[name].probabilities.argmax(dim=1)
+            agreement = (model_predictions == first_pass_predictions).float()
             dynamic_weights[name] = dynamic_weights[name] * (1.0 + self.agreement_bonus * agreement)
 
-        normalized_final = self._normalize_weights(dynamic_weights)
+        normalized_final = self._normalize_weights(dynamic_weights, eps=self.eps)
 
         if self.aggregation == "prob":
-            final_prob = None
+            final_probabilities = torch.zeros_like(first_pass_probabilities)
             for name in self.model_names:
-                weighted = model_outputs[name]["probabilities"] * normalized_final[name].unsqueeze(1)
-                final_prob = weighted if final_prob is None else final_prob + weighted
-            assert final_prob is not None
-            final_logits = final_prob.clamp_min(1e-8).log()
+                final_probabilities = final_probabilities + (
+                    model_outputs[name].probabilities * normalized_final[name].unsqueeze(1)
+                )
+            final_log_probabilities = final_probabilities.clamp_min(self.eps).log()
+            raw_logits = None
+            output_tensor = final_log_probabilities
         else:
-            final_logits = None
+            raw_logits = torch.zeros_like(next(iter(model_outputs.values())).logits)
             for name in self.model_names:
-                weighted = model_outputs[name]["logits"] * normalized_final[name].unsqueeze(1)
-                final_logits = weighted if final_logits is None else final_logits + weighted
-            assert final_logits is not None
-            final_prob = F.softmax(final_logits, dim=1)
+                raw_logits = raw_logits + (model_outputs[name].logits * normalized_final[name].unsqueeze(1))
+            final_probabilities = F.softmax(raw_logits, dim=1)
+            final_log_probabilities = final_probabilities.clamp_min(self.eps).log()
+            output_tensor = raw_logits
 
-        predictions = final_prob.argmax(dim=1)
+        return BoostingEnsembleOutput(
+            output_tensor=output_tensor,
+            predictions=final_probabilities.argmax(dim=1),
+            probabilities=final_probabilities,
+            log_probabilities=final_log_probabilities,
+            raw_logits=raw_logits,
+            aggregation=self.aggregation,
+            model_outputs=model_outputs,
+            dynamic_weights=normalized_final,
+            first_pass_probabilities=first_pass_probabilities,
+            first_pass_log_probabilities=first_pass_log_probabilities,
+        )
 
-        if not return_details:
-            return predictions
+    def forward(
+        self,
+        images: Tensor,
+        *,
+        tta_transforms: Optional[Sequence[TTAFn]] = None,
+    ) -> Tensor:
+        return self._build_output(images, tta_transforms=tta_transforms).output_tensor
 
-        details: Dict[str, object] = {
-            "predictions": predictions,
-            "probabilities": final_prob,
-            "logits": final_logits,
-            "model_outputs": model_outputs,
-            "dynamic_weights": normalized_final,
-        }
-        return details
+    @torch.no_grad()
+    def predict(self, images: Tensor, *, tta_transforms: Optional[Sequence[TTAFn]] = None) -> Tensor:
+        return self.predict_with_details(images, tta_transforms=tta_transforms).predictions
+
+    @torch.no_grad()
+    def predict_proba(self, images: Tensor, *, tta_transforms: Optional[Sequence[TTAFn]] = None) -> Tensor:
+        return self.predict_with_details(images, tta_transforms=tta_transforms).probabilities
+
+    @torch.no_grad()
+    def predict_with_details(
+        self,
+        images: Tensor,
+        *,
+        tta_transforms: Optional[Sequence[TTAFn]] = None,
+    ) -> BoostingEnsembleOutput:
+        return self._build_output(images, tta_transforms=tta_transforms)
 
 
 @torch.no_grad()
 def predict_with_weighted_boosting(
-    model_specs: Mapping[str, Union[nn.Module, BaseModelSpec, Tuple[nn.Module, float]]],
+    model_specs: Mapping[str, ModelSpecValue],
     images: Tensor,
     *,
     device: Union[str, torch.device],
@@ -223,41 +315,25 @@ def predict_with_weighted_boosting(
     agreement_bonus: float = 0.10,
     tta_transforms: Optional[Sequence[TTAFn]] = None,
     return_details: bool = True,
-) -> Union[Tensor, Dict[str, object]]:
-    """
-    Convenience function if you prefer a functional API.
-    """
-    images = images.to(device)
+) -> Union[Tensor, BoostingEnsembleOutput]:
+    device = torch.device(device)
     ensemble = WeightedBoostingEnsemble(
         model_specs,
         aggregation=aggregation,
         uncertainty_penalty=uncertainty_penalty,
         agreement_bonus=agreement_bonus,
     ).to(device)
-    return ensemble(images, return_details=return_details, tta_transforms=tta_transforms)
+    images = images.to(device)
+    if return_details:
+        return ensemble.predict_with_details(images, tta_transforms=tta_transforms)
+    return ensemble.predict(images, tta_transforms=tta_transforms)
 
 
-if __name__ == "__main__":
-    # Example usage.
-
-    if torch.mps.is_available():
-        device = torch.device("mps")
-    elif torch.cuda.is_available():
-        device = torch.device("cuda")
-    else:
-        device = torch.device("cpu")
-
-    models = {
-        "cnn_a": BaseModelSpec(SOMEMODEL().to(device), weight=1.2, temperature=1.0),
-        "cnn_b": BaseModelSpec(SOMEMODEL().to(device), weight=0.9, temperature=1.1),
-        "cnn_c": BaseModelSpec(SOMEMODEL().to(device), weight=1.4, temperature=0.95),
-    }
-
-    result = predict_with_weighted_boosting(
-        models,
-        x,
-        device=device,
-        tta_transforms=WeightedBoostingEnsemble.default_tta_transforms(),
-    )
-    print("Predictions:", result["predictions"])
-    print("Dynamic weights:", {k: v[:3].tolist() for k, v in result["dynamic_weights"].items()})
+__all__ = [
+    "BaseModelOutput",
+    "BaseModelSpec",
+    "BoostingEnsembleOutput",
+    "TTAFn",
+    "WeightedBoostingEnsemble",
+    "predict_with_weighted_boosting",
+]
