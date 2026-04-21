@@ -10,7 +10,7 @@ from src.dataset.augmentation import Augmentation
 N_FOLDS = 5
 BATCH_SIZE = 64
 EPOCHS = 10
-MODEL_NAME = "DenseNet121"
+MODEL_NAME = "EfficientNet"
 csv_path = f'folds/train_folds_{N_FOLDS}.csv'
 
 def training_session(df, name_model, fold):

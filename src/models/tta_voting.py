@@ -1,13 +1,14 @@
 import torch
 import torchvision.transforms.functional as TF
 
-def tta_voting(models_list, images, device):
+def tta_voting(models_list, weights_list, images, device):
     shift_img = TF.affine(images, angle=0, translate=[2, 2], scale=1.0, shear=0)
     rot_img = TF.affine(images, angle=10, translate=[0, 0], scale=1.0, shear=0)
 
     final_prob = torch.zeros(images.size(0), 10).to(device)
+    total_weight = sum(weights_list)
 
-    for net in models_list:
+    for net, weight in zip(models_list, weights_list):
         net.eval()
         with torch.no_grad():
             out1 = net(images)
@@ -19,7 +20,7 @@ def tta_voting(models_list, images, device):
             p3 = torch.softmax(out3, dim=1)
             
             tta_prob = (p1 + p2 + p3) / 3.0
-            final_prob += tta_prob
+            final_prob += tta_prob * weight
             
-    final_prob = final_prob / len(models_list)
+    final_prob = final_prob / total_weight
     return torch.argmax(final_prob, dim=1)
