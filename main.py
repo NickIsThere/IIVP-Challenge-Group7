@@ -6,12 +6,15 @@ from src.dataset.data_pipeline import DataPipeline
 from src.dataset.trainer import Trainer
 from src.models.factory import Factory
 from src.dataset.augmentation import Augmentation
+from src.models.ensemble_pipeline import run_stacking_oof_cv, default_data_transforms
 
 N_FOLDS = 5
 BATCH_SIZE = 64
 EPOCHS = 10
 MODEL_NAME = "EfficientNet"
 csv_path = f'folds/train_folds_{N_FOLDS}.csv'
+MODELS = ["ResNet18", "DenseNet121", "EfficientNet"]
+PATH_TO_SAVE = "main_triple_stacking_ensemble.pth"
 
 def training_session(df, name_model, fold):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -58,15 +61,44 @@ def main():
 
     print("cuda" if torch.cuda.is_available() else "cpu")
 
-    results = []
-    for fold in range(N_FOLDS):
-        print(f"Fold {fold + 1}")
-        result = training_session(df, MODEL_NAME, fold)
-        results.append(result)
-        print(f"Fold {fold + 1}/{N_FOLDS} | best accuracy: {result:.4f}")
-    accuracy = sum(results) / len(results)
-    print(f"Average accuracy: {accuracy:.5f}")
-    # Current: Average accuracy:  0.99806
+    # Test for one model
+    # results = []
+    # for fold in range(N_FOLDS):
+    #     print(f"Fold {fold + 1}")
+    #     result = training_session(df, MODEL_NAME, fold)
+    #     results.append(result)
+    #     print(f"Fold {fold + 1}/{N_FOLDS} | best accuracy: {result:.4f}")
+    # accuracy = sum(results) / len(results)
+    # print(f"Average accuracy: {accuracy:.5f}")
+
+    # Create ensemble
+    save_dir = "ensembled_models"
+    os.makedirs(save_dir, exist_ok=True)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print("cuda" if torch.cuda.is_available() else "cpu")
+
+    transforms = default_data_transforms(train_augmentation_prob=0.4)
+
+    result = run_stacking_oof_cv(
+        df=df,
+        base_model_names=MODELS,
+        folds=[0, 1, 2, 3, 4],
+        num_classes=10,
+        batch_size=64,
+        epochs=10,           
+        num_workers=2,       
+        data_transforms=transforms,
+        device=device
+    )
+
+    print("=" * 20)
+    print(f"Ensemble accuracy: {result.oof_accuracy:.5f}")
+    print("=" * 20)
+
+    save_path = os.path.join(save_dir, PATH_TO_SAVE)
+    torch.save(result.stacker.state_dict(), save_path)
+    print(f"Model is saved as {save_path}")
 
 if __name__ == "__main__":
     main()

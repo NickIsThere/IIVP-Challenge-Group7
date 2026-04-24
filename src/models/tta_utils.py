@@ -5,6 +5,7 @@ from typing import Callable, List, Optional, Sequence
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torchvision.transforms.functional as TF
 
 
 Tensor = torch.Tensor
@@ -18,8 +19,8 @@ def _identity(images: Tensor) -> Tensor:
 def default_tta_transforms() -> List[TTAFn]:
     return [
         _identity,
-        lambda images: torch.flip(images, dims=[-1]),
-        lambda images: torch.flip(images, dims=[-2]),
+        lambda images: TF.affine(images, angle=0, translate=[2, 2], scale=1.0, shear=0),
+        lambda images: TF.affine(images, angle=10, translate=[0, 0], scale=1.0, shear=0)
     ]
 
 

@@ -1,5 +1,6 @@
 import torch
 from tqdm import tqdm
+import copy
 
 class Trainer:
     def __init__(self, model, criterion, optimizer, device, scheduler=None):
@@ -63,7 +64,9 @@ class Trainer:
         return epoch_loss, epoch_acc
 
     def fit(self, train_loader, val_loader, epochs):
+        # Current best model
         best_acc = 0.0
+        best_model_wts = copy.deepcopy(self.model.state_dict())
         for epoch in range(epochs):
             train_loss, train_acc = self.train_epoch(train_loader)
             val_loss, val_acc = self.validate_epoch(val_loader)
@@ -85,5 +88,9 @@ class Trainer:
 
             if val_acc > best_acc:
                 best_acc = val_acc
+                best_model_wts = copy.deepcopy(self.model.state_dict())
+
+        # Save model from best epoch
+        self.model.load_state_dict(best_model_wts)
 
         return best_acc, self.history
