@@ -89,7 +89,7 @@ def create_ensemble(df):
     )
 
     print("=" * 20)
-    print(f"Ensemble accuracy: {result.oof_accuracy:.5f}")
+    print(f"Meta-validation accuracy: {result.meta_validation_accuracy:.5f}")
     print("=" * 20)
 
     save_path = os.path.join(save_dir, PATH_TO_SAVE)

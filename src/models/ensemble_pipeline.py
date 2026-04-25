@@ -66,15 +66,29 @@ class OOFMetaFeatureCollection:
 class StackingExperimentResult:
     kind: str
     base_model_names: List[str]
-    oof_accuracy: float
+    meta_validation_accuracy: float
+    meta_validation_fold: int
     meta_feature_shape: Tuple[int, int]
     meta_features: Tensor
     targets: Tensor
     sample_indices: Tuple[int, ...]
+    meta_train_sample_indices: Tuple[int, ...]
+    meta_validation_sample_indices: Tuple[int, ...]
     fold_sample_indices: Dict[int, Tuple[int, ...]]
     base_model_accuracies: Dict[str, List[float]]
     fit_history: MetaLearnerFitResult
     stacker: StackingEnsemble
+
+
+@dataclass
+class MetaFeatureSplit:
+    train_features: Tensor
+    train_targets: Tensor
+    validation_features: Tensor
+    validation_targets: Tensor
+    train_sample_indices: Tensor
+    validation_sample_indices: Tensor
+    validation_fold: int
 
 
 def default_data_transforms(train_augmentation_prob: float = 0.4) -> Dict[str, transforms.Compose]:
@@ -153,6 +167,45 @@ def _evaluate_classifier(model: nn.Module, loader, *, device: torch.device) -> f
             total += labels.size(0)
 
     return correct / max(total, 1)
+
+
+def _split_oof_meta_features(
+    collection: OOFMetaFeatureCollection,
+    *,
+    meta_validation_fold: int,
+) -> MetaFeatureSplit:
+    if meta_validation_fold not in collection.fold_sample_indices:
+        raise ValueError(f"Fold {meta_validation_fold} is not present in the OOF meta-feature collection.")
+
+    sample_indices = collection.sample_indices
+    index_to_position = {
+        int(sample_index): position
+        for position, sample_index in enumerate(sample_indices.tolist())
+    }
+
+    validation_positions = sorted(
+        index_to_position[int(sample_index)]
+        for sample_index in collection.fold_sample_indices[meta_validation_fold]
+    )
+
+    validation_mask = torch.zeros(sample_indices.numel(), dtype=torch.bool)
+    validation_mask[validation_positions] = True
+    train_mask = ~validation_mask
+
+    if not train_mask.any():
+        raise ValueError("Meta-train split is empty. Provide at least one non-validation fold.")
+    if not validation_mask.any():
+        raise ValueError("Meta-validation split is empty. The held-out fold must contain samples.")
+
+    return MetaFeatureSplit(
+        train_features=collection.meta_features[train_mask],
+        train_targets=collection.targets[train_mask],
+        validation_features=collection.meta_features[validation_mask],
+        validation_targets=collection.targets[validation_mask],
+        train_sample_indices=sample_indices[train_mask],
+        validation_sample_indices=sample_indices[validation_mask],
+        validation_fold=meta_validation_fold,
+    )
 
 
 def run_single_model_cv(
@@ -411,6 +464,9 @@ def run_stacking_oof_cv(
     meta_fit_kwargs: Optional[dict] = None,
     model_kwargs_by_name: Optional[Mapping[str, dict]] = None,
 ) -> StackingExperimentResult:
+    if len(folds) < 2:
+        raise ValueError("Stacking requires at least 2 folds so one fold can be held out for meta-validation.")
+
     oof_collection = collect_oof_meta_features(
         df,
         base_model_names,
@@ -425,6 +481,11 @@ def run_stacking_oof_cv(
         stacking_kwargs=stacking_kwargs,
         model_kwargs_by_name=model_kwargs_by_name,
     )
+    meta_validation_fold = int(folds[-1])
+    meta_split = _split_oof_meta_features(
+        oof_collection,
+        meta_validation_fold=meta_validation_fold,
+    )
 
     stacker = StackingEnsemble(
         oof_collection.reference_base_models,
@@ -435,23 +496,26 @@ def run_stacking_oof_cv(
     resolved_meta_fit_kwargs = {"batch_size": batch_size, "verbose": False}
     resolved_meta_fit_kwargs.update(meta_fit_kwargs or {})
     fit_history = stacker.fit_meta_learner(
-        oof_collection.meta_features,
-        oof_collection.targets,
+        meta_split.train_features,
+        meta_split.train_targets,
         device=device,
         **resolved_meta_fit_kwargs,
     )
 
-    predictions = stacker.predict_from_meta_features(oof_collection.meta_features.to(device)).predictions.cpu()
-    oof_accuracy = (predictions == oof_collection.targets).float().mean().item()
+    predictions = stacker.predict_from_meta_features(meta_split.validation_features.to(device)).predictions.cpu()
+    meta_validation_accuracy = (predictions == meta_split.validation_targets).float().mean().item()
 
     return StackingExperimentResult(
         kind="stacking",
         base_model_names=list(base_model_names),
-        oof_accuracy=oof_accuracy,
+        meta_validation_accuracy=meta_validation_accuracy,
+        meta_validation_fold=meta_split.validation_fold,
         meta_feature_shape=tuple(oof_collection.meta_features.shape),
         meta_features=oof_collection.meta_features,
         targets=oof_collection.targets,
         sample_indices=tuple(int(index) for index in oof_collection.sample_indices.tolist()),
+        meta_train_sample_indices=tuple(int(index) for index in meta_split.train_sample_indices.tolist()),
+        meta_validation_sample_indices=tuple(int(index) for index in meta_split.validation_sample_indices.tolist()),
         fold_sample_indices=oof_collection.fold_sample_indices,
         base_model_accuracies=oof_collection.base_model_accuracies,
         fit_history=fit_history,
