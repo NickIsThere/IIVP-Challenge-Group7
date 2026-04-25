@@ -1,6 +1,6 @@
 import torch
 from tqdm import tqdm
-import copy
+from torch.optim.swa_utils import AveragedModel, SWALR
 
 class Trainer:
     def __init__(self, model, criterion, optimizer, device, scheduler=None):
@@ -9,6 +9,11 @@ class Trainer:
         self.optimizer = optimizer
         self.device = device
         self.scheduler = scheduler
+        
+        self.swa_model = AveragedModel(model)
+        self.swa_scheduler = SWALR(optimizer, swa_lr=1e-4)
+        # Start SWA at 10th epoch
+        self.swa_start_epoch = 10
         self.history = {"train_loss": [], "train_acc": [], "val_loss": [], "val_acc": []}
 
     def train_epoch(self, loader):
@@ -40,8 +45,9 @@ class Trainer:
         epoch_acc = correct / total
         return epoch_loss, epoch_acc
 
-    def validate_epoch(self, loader):
-        self.model.eval()
+    def validate_epoch(self, loader, current_model=None):
+        model_to_eval = current_model if current_model is not None else self.model
+        model_to_eval.eval()
         running_loss = 0.0
         correct = 0
         total = 0
@@ -51,7 +57,7 @@ class Trainer:
                 images = images.to(self.device)
                 labels = labels.to(self.device)
 
-                outputs = self.model(images)
+                outputs = model_to_eval(images)
                 loss = self.criterion(outputs, labels)
 
                 running_loss += loss.item() * images.size(0)
@@ -64,18 +70,26 @@ class Trainer:
         return epoch_loss, epoch_acc
 
     def fit(self, train_loader, val_loader, epochs):
-        # Current best model
         best_acc = 0.0
-        best_model_wts = copy.deepcopy(self.model.state_dict())
+        
         for epoch in range(epochs):
             train_loss, train_acc = self.train_epoch(train_loader)
-            val_loss, val_acc = self.validate_epoch(val_loader)
 
-            if self.scheduler is not None:
-                self.scheduler.step()
-                current_lr = self.scheduler.get_last_lr()[0]
+            if epoch >= self.swa_start_epoch:
+                self.swa_model.update_parameters(self.model)
+                self.swa_scheduler.step()
             else:
-                current_lr = self.optimizer.param_groups[0]['lr']
+                if self.scheduler is not None:
+                    self.scheduler.step()
+
+            current_lr = self.optimizer.param_groups[0]['lr']
+
+            if epoch >= self.swa_start_epoch:
+                torch.optim.swa_utils.update_bn(train_loader, self.swa_model, device=self.device)
+                val_loss, val_acc = self.validate_epoch(val_loader, current_model=self.swa_model)
+            else:
+                val_loss, val_acc = self.validate_epoch(val_loader, current_model=self.model)
+
 
             self.history["train_loss"].append(train_loss)
             self.history["train_acc"].append(train_acc)
@@ -88,9 +102,8 @@ class Trainer:
 
             if val_acc > best_acc:
                 best_acc = val_acc
-                best_model_wts = copy.deepcopy(self.model.state_dict())
 
-        # Save model from best epoch
-        self.model.load_state_dict(best_model_wts)
+        # Save SWA model
+        self.model = self.swa_model.module
 
         return best_acc, self.history

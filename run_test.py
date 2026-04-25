@@ -12,8 +12,8 @@ from src.models.stacking_ensemble import StackingEnsemble
 
 TEST_CSV = "data/test.csv"
 TEST_DIR = "data/test/test"
-MODEL_PATH = "ensembled_models/main_triple_stacking_ensemble.pth"
-OUTPUT_CSV = "data/submission_on_main.csv"
+MODEL_PATH = "ensembled_models/main_triple_stacking_longer_swa.pth"
+OUTPUT_CSV = "data/submission_on_main_longer_swa.csv"
 MODELS = ["ResNet18", "DenseNet121", "EfficientNet"]
 
 def make_predictions(test_loader, stacker, device):

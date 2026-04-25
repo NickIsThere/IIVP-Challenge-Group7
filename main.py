@@ -10,11 +10,12 @@ from src.models.ensemble_pipeline import run_stacking_oof_cv, default_data_trans
 
 N_FOLDS = 5
 BATCH_SIZE = 64
-EPOCHS = 10
-MODEL_NAME = "EfficientNet"
+EPOCHS = 15
+MODEL_NAME = "ResNet18"
 csv_path = f'folds/train_folds_{N_FOLDS}.csv'
 MODELS = ["ResNet18", "DenseNet121", "EfficientNet"]
-PATH_TO_SAVE = "main_triple_stacking_ensemble.pth"
+PATH_TO_SAVE = "main_triple_stacking_longer_swa.pth"
+
 
 def training_session(df, name_model, fold):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -41,6 +42,7 @@ def training_session(df, name_model, fold):
 
     # Add label smoothing so the model is not overconfident
     criterion = torch.nn.CrossEntropyLoss(label_smoothing=0.1)
+    # criterion = FocalLoss(gamma=2.0, label_smoothing=0.1)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
     # Make floating learning rate using Cosine Annealing
@@ -52,26 +54,20 @@ def training_session(df, name_model, fold):
 
     return best_accuracy
 
-def main():
-    if not os.path.exists(csv_path):
-        print(f"Such file doesn't exist: {csv_path}")
-        return
-    
-    df = pd.read_csv(csv_path)
-
+def test_model(df):
     print("cuda" if torch.cuda.is_available() else "cpu")
 
     # Test for one model
-    # results = []
-    # for fold in range(N_FOLDS):
-    #     print(f"Fold {fold + 1}")
-    #     result = training_session(df, MODEL_NAME, fold)
-    #     results.append(result)
-    #     print(f"Fold {fold + 1}/{N_FOLDS} | best accuracy: {result:.4f}")
-    # accuracy = sum(results) / len(results)
-    # print(f"Average accuracy: {accuracy:.5f}")
+    results = []
+    for fold in range(N_FOLDS):
+        print(f"Fold {fold + 1}")
+        result = training_session(df, MODEL_NAME, fold)
+        results.append(result)
+        print(f"Fold {fold + 1}/{N_FOLDS} | best accuracy: {result:.4f}")
+    accuracy = sum(results) / len(results)
+    print(f"Average accuracy: {accuracy:.5f}")
 
-    # Create ensemble
+def create_ensemble(df):
     save_dir = "ensembled_models"
     os.makedirs(save_dir, exist_ok=True)
 
@@ -85,8 +81,8 @@ def main():
         base_model_names=MODELS,
         folds=[0, 1, 2, 3, 4],
         num_classes=10,
-        batch_size=64,
-        epochs=10,           
+        batch_size=BATCH_SIZE,
+        epochs=EPOCHS,           
         num_workers=2,       
         data_transforms=transforms,
         device=device
@@ -99,6 +95,18 @@ def main():
     save_path = os.path.join(save_dir, PATH_TO_SAVE)
     torch.save(result.stacker.state_dict(), save_path)
     print(f"Model is saved as {save_path}")
+
+
+def main():
+    if not os.path.exists(csv_path):
+        print(f"Such file doesn't exist: {csv_path}")
+        return
+    
+    df = pd.read_csv(csv_path)
+
+    # test_model(df)
+
+    create_ensemble(df)
 
 if __name__ == "__main__":
     main()
