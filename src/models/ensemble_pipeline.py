@@ -15,6 +15,8 @@ from src.models.boosting_ensemble import BaseModelSpec, WeightedBoostingEnsemble
 from src.models.factory import Factory
 from src.models.stacking_ensemble import MetaLearnerFitResult, StackingEnsemble
 
+# Transparency: The Pin memory ( memory that is dedicated and "pinned" to the CPU in batches) is a speed up
+# technique that an LLM proposed
 
 Tensor = torch.Tensor
 
@@ -59,6 +61,7 @@ class OOFMetaFeatureCollection:
     sample_indices: Tensor
     fold_sample_indices: Dict[int, Tuple[int, ...]]
     base_model_accuracies: Dict[str, List[float]]
+    base_model_histories: Dict[str, List[Dict[str, List[float]]]]
     reference_base_models: Mapping[str, BaseModelSpec]
 
 
@@ -78,6 +81,19 @@ class StackingExperimentResult:
     base_model_accuracies: Dict[str, List[float]]
     fit_history: MetaLearnerFitResult
     stacker: StackingEnsemble
+
+
+@dataclass
+class StackingMetaCVResult:
+    kind: str
+    fold_accuracies: List[float]
+    mean_accuracy: float
+    oof_predictions: Tensor
+    oof_targets: Tensor
+    sample_indices: Tuple[int, ...]
+    meta_fit_histories: Dict[int, MetaLearnerFitResult]
+    meta_train_sample_indices_by_fold: Dict[int, Tuple[int, ...]]
+    meta_validation_sample_indices_by_fold: Dict[int, Tuple[int, ...]]
 
 
 @dataclass
@@ -122,9 +138,10 @@ def _build_loaders(
     data_transforms: Dict[str, transforms.Compose],
     batch_size: int,
     num_workers: int,
+    pin_memory: bool = True,
 ):
     pipeline = DataPipeline(train_df.reset_index(drop=True), val_df.reset_index(drop=True), transforms=data_transforms)
-    return pipeline.get_loaders(batch_size=batch_size, num_workers=num_workers)
+    return pipeline.get_loaders(batch_size=batch_size, num_workers=num_workers, pin_memory=pin_memory)
 
 
 def _train_model(
@@ -136,6 +153,7 @@ def _train_model(
     num_classes: int,
     epochs: int,
     model_kwargs: Optional[dict] = None,
+    trainer_kwargs: Optional[dict] = None,
 ) -> Tuple[nn.Module, float, Dict[str, List[float]]]:
     model = Factory.get_model(model_name, num_classes=num_classes, **(model_kwargs or {})).to(device)
 
@@ -143,9 +161,9 @@ def _train_model(
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
 
-    trainer = Trainer(model, criterion, optimizer, device, scheduler)
+    trainer = Trainer(model, criterion, optimizer, device, scheduler, **(trainer_kwargs or {}))
     best_accuracy, history = trainer.fit(train_loader, val_loader, epochs)
-    return model, best_accuracy, history
+    return trainer.model, best_accuracy, history
 
 
 def _evaluate_classifier(model: nn.Module, loader, *, device: torch.device) -> float:
@@ -207,7 +225,7 @@ def _split_oof_meta_features(
         validation_fold=meta_validation_fold,
     )
 
-
+# Needed some help from the LLM with the kwargs here!
 def run_single_model_cv(
     df: pd.DataFrame,
     model_name: str,
@@ -220,6 +238,8 @@ def run_single_model_cv(
     data_transforms: Dict[str, transforms.Compose],
     device: torch.device,
     model_kwargs: Optional[dict] = None,
+    trainer_kwargs: Optional[dict] = None,
+    pin_memory: bool = True,
 ) -> SingleModelExperimentResult:
     fold_accuracies: List[float] = []
 
@@ -232,6 +252,7 @@ def run_single_model_cv(
             data_transforms=data_transforms,
             batch_size=batch_size,
             num_workers=num_workers,
+            pin_memory=pin_memory,
         )
         _, best_accuracy, _ = _train_model(
             model_name,
@@ -241,6 +262,7 @@ def run_single_model_cv(
             num_classes=num_classes,
             epochs=epochs,
             model_kwargs=model_kwargs,
+            trainer_kwargs=trainer_kwargs,
         )
         fold_accuracies.append(best_accuracy)
 
@@ -265,6 +287,8 @@ def _train_base_models_for_fold(
     data_transforms: Dict[str, transforms.Compose],
     device: torch.device,
     model_kwargs_by_name: Optional[Mapping[str, dict]] = None,
+    trainer_kwargs: Optional[dict] = None,
+    pin_memory: bool = True,
 ) -> Tuple[List[BaseModelTrainingResult], object]:
     train_df = df[df["fold"] != fold]
     val_df = df[df["fold"] == fold]
@@ -274,6 +298,7 @@ def _train_base_models_for_fold(
         data_transforms=data_transforms,
         batch_size=batch_size,
         num_workers=num_workers,
+        pin_memory=pin_memory,
     )
 
     training_results: List[BaseModelTrainingResult] = []
@@ -286,6 +311,7 @@ def _train_base_models_for_fold(
             num_classes=num_classes,
             epochs=epochs,
             model_kwargs=(model_kwargs_by_name or {}).get(model_name),
+            trainer_kwargs=trainer_kwargs,
         )
         training_results.append(
             BaseModelTrainingResult(
@@ -300,7 +326,7 @@ def _train_base_models_for_fold(
 
     return training_results, val_loader
 
-
+# Needed some help from the LLM with the kwargs here!
 def run_boosting_cv(
     df: pd.DataFrame,
     base_model_names: Sequence[str],
@@ -314,6 +340,8 @@ def run_boosting_cv(
     device: torch.device,
     boosting_kwargs: Optional[dict] = None,
     model_kwargs_by_name: Optional[Mapping[str, dict]] = None,
+    trainer_kwargs: Optional[dict] = None,
+    pin_memory: bool = True,
 ) -> BoostingExperimentResult:
     aliased_model_names = _alias_model_names(base_model_names)
     fold_accuracies: List[float] = []
@@ -330,6 +358,8 @@ def run_boosting_cv(
             data_transforms=data_transforms,
             device=device,
             model_kwargs_by_name=model_kwargs_by_name,
+            trainer_kwargs=trainer_kwargs,
+            pin_memory=pin_memory,
         )
 
         model_specs = {
@@ -362,6 +392,8 @@ def collect_oof_meta_features(
     boosting_kwargs: Optional[dict] = None,
     stacking_kwargs: Optional[dict] = None,
     model_kwargs_by_name: Optional[Mapping[str, dict]] = None,
+    trainer_kwargs: Optional[dict] = None,
+    pin_memory: bool = True,
 ) -> OOFMetaFeatureCollection:
     aliased_model_names = _alias_model_names(base_model_names)
     feature_chunks: List[Tensor] = []
@@ -369,6 +401,7 @@ def collect_oof_meta_features(
     sample_index_chunks: List[Tensor] = []
     fold_sample_indices: Dict[int, Tuple[int, ...]] = {}
     base_model_accuracies = {alias: [] for alias, _ in aliased_model_names}
+    base_model_histories = {alias: [] for alias, _ in aliased_model_names}
     reference_base_models: Optional[Mapping[str, BaseModelSpec]] = None
 
     for fold in folds:
@@ -385,12 +418,15 @@ def collect_oof_meta_features(
             data_transforms=data_transforms,
             device=device,
             model_kwargs_by_name=model_kwargs_by_name,
+            trainer_kwargs=trainer_kwargs,
+            pin_memory=pin_memory,
         )
 
         model_specs = {result.alias: BaseModelSpec(model=result.model) for result in training_results}
         reference_base_models = model_specs
         for result in training_results:
             base_model_accuracies[result.alias].append(result.best_accuracy)
+            base_model_histories[result.alias].append(result.history)
 
         stacker = StackingEnsemble(
             model_specs,
@@ -444,7 +480,80 @@ def collect_oof_meta_features(
         sample_indices=sample_indices,
         fold_sample_indices=fold_sample_indices,
         base_model_accuracies=base_model_accuracies,
+        base_model_histories=base_model_histories,
         reference_base_models=reference_base_models,
+    )
+
+
+def run_stacking_meta_cv(
+    collection: OOFMetaFeatureCollection,
+    *,
+    device: torch.device,
+    folds: Optional[Sequence[int]] = None,
+    boosting_kwargs: Optional[dict] = None,
+    stacking_kwargs: Optional[dict] = None,
+    meta_fit_kwargs: Optional[dict] = None,
+) -> StackingMetaCVResult:
+    resolved_folds = tuple(folds or sorted(collection.fold_sample_indices))
+    if not resolved_folds:
+        raise ValueError("At least one fold is required to run stacking meta cross-validation.")
+
+    resolved_meta_fit_kwargs = {"batch_size": 64, "verbose": False}
+    resolved_meta_fit_kwargs.update(meta_fit_kwargs or {})
+
+    num_classes = int(collection.targets.max().item()) + 1
+    index_to_position = {
+        int(sample_index): position
+        for position, sample_index in enumerate(collection.sample_indices.tolist())
+    }
+
+    oof_predictions = torch.full_like(collection.targets, fill_value=-1)
+    meta_fit_histories: Dict[int, MetaLearnerFitResult] = {}
+    meta_train_sample_indices_by_fold: Dict[int, Tuple[int, ...]] = {}
+    meta_validation_sample_indices_by_fold: Dict[int, Tuple[int, ...]] = {}
+    fold_accuracies: List[float] = []
+
+    for fold in resolved_folds:
+        meta_split = _split_oof_meta_features(collection, meta_validation_fold=fold)
+        stacker = StackingEnsemble(
+            collection.reference_base_models,
+            num_classes=num_classes,
+            boosting_kwargs=boosting_kwargs,
+            **(stacking_kwargs or {}),
+        )
+        fit_history = stacker.fit_meta_learner(
+            meta_split.train_features,
+            meta_split.train_targets,
+            device=device,
+            **resolved_meta_fit_kwargs,
+        )
+        predictions = stacker.predict_from_meta_features(meta_split.validation_features.to(device)).predictions.cpu()
+        accuracy = (predictions == meta_split.validation_targets).float().mean().item()
+
+        fold_accuracies.append(accuracy)
+        meta_fit_histories[fold] = fit_history
+        meta_train_sample_indices_by_fold[fold] = tuple(int(index) for index in meta_split.train_sample_indices.tolist())
+        meta_validation_sample_indices_by_fold[fold] = tuple(
+            int(index) for index in meta_split.validation_sample_indices.tolist()
+        )
+
+        for sample_index, prediction in zip(meta_split.validation_sample_indices.tolist(), predictions.tolist()):
+            oof_predictions[index_to_position[int(sample_index)]] = int(prediction)
+
+    if (oof_predictions < 0).any():
+        raise ValueError("Stacking meta cross-validation did not produce predictions for every sample.")
+
+    mean_accuracy = sum(fold_accuracies) / max(len(fold_accuracies), 1)
+    return StackingMetaCVResult(
+        kind="stacking_meta_cv",
+        fold_accuracies=fold_accuracies,
+        mean_accuracy=mean_accuracy,
+        oof_predictions=oof_predictions,
+        oof_targets=collection.targets.clone(),
+        sample_indices=tuple(int(index) for index in collection.sample_indices.tolist()),
+        meta_fit_histories=meta_fit_histories,
+        meta_train_sample_indices_by_fold=meta_train_sample_indices_by_fold,
+        meta_validation_sample_indices_by_fold=meta_validation_sample_indices_by_fold,
     )
 
 
@@ -463,6 +572,8 @@ def run_stacking_oof_cv(
     stacking_kwargs: Optional[dict] = None,
     meta_fit_kwargs: Optional[dict] = None,
     model_kwargs_by_name: Optional[Mapping[str, dict]] = None,
+    trainer_kwargs: Optional[dict] = None,
+    pin_memory: bool = True,
 ) -> StackingExperimentResult:
     if len(folds) < 2:
         raise ValueError("Stacking requires at least 2 folds so one fold can be held out for meta-validation.")
@@ -480,6 +591,8 @@ def run_stacking_oof_cv(
         boosting_kwargs=boosting_kwargs,
         stacking_kwargs=stacking_kwargs,
         model_kwargs_by_name=model_kwargs_by_name,
+        trainer_kwargs=trainer_kwargs,
+        pin_memory=pin_memory,
     )
     meta_validation_fold = int(folds[-1])
     meta_split = _split_oof_meta_features(
@@ -528,9 +641,11 @@ __all__ = [
     "OOFMetaFeatureCollection",
     "SingleModelExperimentResult",
     "StackingExperimentResult",
+    "StackingMetaCVResult",
     "collect_oof_meta_features",
     "default_data_transforms",
     "run_boosting_cv",
     "run_single_model_cv",
+    "run_stacking_meta_cv",
     "run_stacking_oof_cv",
 ]

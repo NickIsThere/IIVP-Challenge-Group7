@@ -1,19 +1,32 @@
 import torch
-from tqdm import tqdm
 from torch.optim.swa_utils import AveragedModel, SWALR
 
+from tqdm import tqdm
+
+
+
 class Trainer:
-    def __init__(self, model, criterion, optimizer, device, scheduler=None):
+    def __init__(
+        self,
+        model,
+        criterion,
+        optimizer,
+        device,
+        scheduler=None,
+        *,
+        use_swa=True,
+        swa_start_epoch=10,
+        swa_lr=1e-4,
+    ):
         self.model = model
         self.criterion = criterion
         self.optimizer = optimizer
         self.device = device
         self.scheduler = scheduler
-        
-        self.swa_model = AveragedModel(model)
-        self.swa_scheduler = SWALR(optimizer, swa_lr=1e-4)
-        # Start SWA at 10th epoch
-        self.swa_start_epoch = 10
+        self.use_swa = use_swa
+        self.swa_start_epoch = swa_start_epoch
+        self.swa_model = AveragedModel(model) if use_swa else None # easier for comparison! same below!
+        self.swa_scheduler = SWALR(optimizer, swa_lr=swa_lr) if use_swa else None
         self.history = {"train_loss": [], "train_acc": [], "val_loss": [], "val_acc": []}
 
     def train_epoch(self, loader):
@@ -39,7 +52,8 @@ class Trainer:
             correct += (preds == labels).sum().item()
             total += labels.size(0)
 
-            progress_bar.set_postfix({"loss": f"{loss.item():.4f}"})
+            if hasattr(progress_bar, "set_postfix"):
+                progress_bar.set_postfix({"loss": f"{loss.item():.4f}"})
 
         epoch_loss = running_loss / total
         epoch_acc = correct / total
@@ -71,31 +85,32 @@ class Trainer:
 
     def fit(self, train_loader, val_loader, epochs):
         best_acc = 0.0
-        
+
         for epoch in range(epochs):
             train_loss, train_acc = self.train_epoch(train_loader)
 
-            if epoch >= self.swa_start_epoch:
+            swa_active = self.use_swa and epoch >= self.swa_start_epoch
+
+            if swa_active:
                 self.swa_model.update_parameters(self.model)
                 self.swa_scheduler.step()
             else:
                 if self.scheduler is not None:
                     self.scheduler.step()
 
-            current_lr = self.optimizer.param_groups[0]['lr']
+            current_lr = self.optimizer.param_groups[0]["lr"]
 
-            if epoch >= self.swa_start_epoch:
+            if swa_active:
                 torch.optim.swa_utils.update_bn(train_loader, self.swa_model, device=self.device)
                 val_loss, val_acc = self.validate_epoch(val_loader, current_model=self.swa_model)
             else:
                 val_loss, val_acc = self.validate_epoch(val_loader, current_model=self.model)
 
-
             self.history["train_loss"].append(train_loss)
             self.history["train_acc"].append(train_acc)
             self.history["val_loss"].append(val_loss)
             self.history["val_acc"].append(val_acc)
-            
+
             print(f"Epoch {epoch + 1:02d}/{epochs} [LR: {current_lr:.6f}] | "
                   f"train_loss={train_loss:.4f}, train_acc={train_acc:.4f} | "
                   f"val_loss={val_loss:.4f}, val_acc={val_acc:.4f}")
@@ -103,7 +118,7 @@ class Trainer:
             if val_acc > best_acc:
                 best_acc = val_acc
 
-        # Save SWA model
-        self.model = self.swa_model.module
+        if self.use_swa and epochs > self.swa_start_epoch:
+            self.model = self.swa_model.module
 
         return best_acc, self.history
