@@ -1,9 +1,6 @@
 import torch
 from torch.optim.swa_utils import AveragedModel, SWALR
-
 from tqdm import tqdm
-
-
 
 class Trainer:
     def __init__(
